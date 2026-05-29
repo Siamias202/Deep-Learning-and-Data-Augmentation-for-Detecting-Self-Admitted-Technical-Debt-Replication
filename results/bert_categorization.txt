@@ -1,0 +1,35 @@
+======================================================================
+BERT SATD Categorization Results
+Timestamp      : 2026-05-29 13:55:34
+Artifact       : CM
+Command Arguments:
+  --artifact      CM
+  --mode          train
+  --data_dir      /content/Deep-Learning-and-Data-Augmentation-for-Detecting-Self-Admitted-Technical-Debt-Replication/data/preprocessed
+  --bert_model    bert-base-uncased
+  --max_seq_len   128
+  --batch_size    32
+  --epochs        10
+  --learning_rate 5e-05
+  --epsilon       1e-08
+  --hidden_size   256
+  --patience      3
+  --use_augmented False
+  --output_dir    /content/Deep-Learning-and-Data-Augmentation-for-Detecting-Self-Admitted-Technical-Debt-Replication/results
+  --model_dir     /content/Deep-Learning-and-Data-Augmentation-for-Detecting-Self-Admitted-Technical-Debt-Replication/models
+----------------------------------------------------------------------
+Test Set Performance (SATD categories):
+  Class         Precision     Recall   F1-Score    Support
+  -------------------------------------------------------
+  documentation_debt     0.98     0.98     0.98         49
+  requirement_debt     1.0000     1.0000     1.0000         50
+  test_debt        0.9630     1.0000     0.9811         52
+  structural_debt        0.98     0.94     0.96         52
+  
+  -------------------------------------------------------
+         accuracy                           0.98       203
+         macro avg       0.98      0.98      0.98       203
+      weighted avg       0.98      0.98      0.98       203
+Training time  : 244.3s
+======================================================================
+CM   → Macro F1 = 0.9804

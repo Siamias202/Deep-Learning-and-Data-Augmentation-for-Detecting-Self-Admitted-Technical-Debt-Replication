@@ -1,0 +1,23 @@
+!python 02_bilstm_identification.py \
+--artifact CM \
+  --mode train \
+  --data_dir ./data/preprocessed \
+  --glove_path /content/drive/MyDrive/glove.6B/glove.6B.300d.txt \
+  --embedding_dim 300 \
+  --max_seq_len 200 \
+  --batch_size 64 \
+  --epochs 50 \
+  --patience 10 \
+  --output_dir ./results \
+  --model_dir ./models
+
+
+
+precision    recall  f1-score   support
+
+    non_debt       0.92      0.97      0.95       418
+        SATD       0.93      0.83      0.88       203
+
+    accuracy                           0.92       621
+   macro avg       0.93      0.90      0.91       621
+weighted avg       0.92      0.92      0.92       621
