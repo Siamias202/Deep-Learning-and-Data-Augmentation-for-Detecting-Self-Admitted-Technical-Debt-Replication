@@ -52,7 +52,8 @@ Command-line Arguments:
     --model_dir       Model checkpoint dir      (default: models)
 
 Output:
-    - models/bert_{artifact}/          : Saved BERT model + tokenizer
+    - models/bert_{artifact}/            : Saved BERT tokenizer
+    - models/bert_{artifact}_best.pt     : Best model weights
     - models/bert_{artifact}_config.json : Model configuration
     - results/bert_command_arguments.txt : Results log (appended each run)
 """
@@ -69,15 +70,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from torch.optim import AdamW
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-    classification_report,
-    f1_score,
-)
+from sklearn.metrics import classification_report, f1_score
 from transformers import (
     BertTokenizer,
     BertModel,
-    AdamW,
     get_linear_schedule_with_warmup,
 )
 
@@ -102,10 +100,10 @@ ARTIFACT_FILES = {
 }
 
 # Multi-class SATD categories (paper Section III-G)
-SATD_CATEGORIES = ["C/D", "DOC", "TES", "REQ"]
+SATD_CATEGORIES = ['non_debt', 'documentation_debt', 'requirement_debt', 'test_debt', 'code_debt', 'design_debt']
 LABEL2IDX = {label: idx for idx, label in enumerate(SATD_CATEGORIES)}
-IDX2LABEL = {idx: label for label, idx in LABEL2IDX.items()}
-NOT_SATD_LABEL = "Not-SATD"
+IDX2LABEL  = {idx: label for label, idx in LABEL2IDX.items()}
+NOT_SATD_LABEL = "non_debt"
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -119,16 +117,10 @@ class SATDCategoryDataset(Dataset):
     Only SATD instances are included (Not-SATD filtered out).
     """
 
-    def __init__(
-        self,
-        texts: list,
-        labels: list,
-        tokenizer: BertTokenizer,
-        max_seq_len: int,
-    ):
-        self.texts = texts
-        self.labels = labels
-        self.tokenizer = tokenizer
+    def __init__(self, texts: list, labels: list, tokenizer: BertTokenizer, max_seq_len: int):
+        self.texts       = texts
+        self.labels      = labels
+        self.tokenizer   = tokenizer
         self.max_seq_len = max_seq_len
 
     def __len__(self):
@@ -149,7 +141,8 @@ class SATDCategoryDataset(Dataset):
                 "token_type_ids",
                 torch.zeros_like(encoding["input_ids"]),
             ).squeeze(0),
-            "label": torch.tensor(self.labels[idx], dtype=torch.long),
+            # NOTE: key is "class" to match the data column name convention
+            "class": torch.tensor(self.labels[idx], dtype=torch.long),
         }
 
 
@@ -162,7 +155,7 @@ class BERTSATDClassifier(nn.Module):
     BERT-base-uncased with a two-layer classification head.
 
     Head architecture (paper Section III-G):
-        Linear(768 → hidden_size) → ReLU → Linear(hidden_size → num_classes)
+        Linear(768 → hidden_size) → ReLU → Dropout → Linear(hidden_size → num_classes)
     """
 
     def __init__(
@@ -173,10 +166,7 @@ class BERTSATDClassifier(nn.Module):
         dropout_rate: float = 0.1,
     ):
         super(BERTSATDClassifier, self).__init__()
-
         self.bert = BertModel.from_pretrained(bert_model_name)
-
-        # Classifier head: Linear → ReLU → Linear (paper architecture)
         self.classifier = nn.Sequential(
             nn.Linear(self.bert.config.hidden_size, hidden_size),
             nn.ReLU(),
@@ -190,15 +180,41 @@ class BERTSATDClassifier(nn.Module):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
         )
-        # Use [CLS] token representation
-        pooled_output = outputs.pooler_output  # (batch, 768)
-        logits = self.classifier(pooled_output)  # (batch, num_classes)
-        return logits
+        pooled_output = outputs.pooler_output          # (batch, 768)
+        return self.classifier(pooled_output)           # (batch, num_classes)
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+def _resolve_class_column(df: pd.DataFrame, path: str) -> str:
+    """
+    Return the name of the column that holds SATD category labels.
+
+    Priority order:
+      1. 'class'  — used by the raw data CSVs
+      2. 'label'  — used by the preprocessed CSVs written by 01_preprocessing.py
+      3. Any other column whose values overlap with SATD_CATEGORIES
+    """
+    for candidate in ("class", "label"):
+        if candidate in df.columns:
+            return candidate
+
+    # Fallback: find any column whose values intersect SATD_CATEGORIES
+    for col in df.columns:
+        if df[col].isin(SATD_CATEGORIES).any():
+            logger.warning(
+                f"Neither 'class' nor 'label' column found in {path}. "
+                f"Using '{col}' as the category column."
+            )
+            return col
+
+    raise ValueError(
+        f"Cannot find SATD category column in {path}. "
+        f"Expected 'class' or 'label'. Columns present: {list(df.columns)}"
+    )
+
 
 def load_artifact_data(
     artifact_key: str,
@@ -208,6 +224,9 @@ def load_artifact_data(
     """
     Load preprocessed CSV, filter to SATD-only rows, and resolve labels.
     Only rows with valid SATD category labels (C/D, DOC, TES, REQ) are kept.
+
+    The function tolerates both 'class' and 'label' column names and always
+    returns a DataFrame with the target column named 'class'.
     """
     filename = ARTIFACT_FILES[artifact_key]
     path = os.path.join(data_dir, filename)
@@ -216,28 +235,45 @@ def load_artifact_data(
             f"Preprocessed file not found: {path}\n"
             "Run 01_preprocessing.py first."
         )
+
     df = pd.read_csv(path, encoding="utf-8")
     logger.info(f"[{artifact_key}] Loaded {len(df):,} total rows from {path}")
+    logger.info(f"[{artifact_key}] Columns: {list(df.columns)}")
 
-    # ── Keep only SATD instances (filter out Not-SATD) ────────────────────
-    # The 'label' column contains the multi-class SATD type
-    if "label" not in df.columns:
-        raise ValueError(f"'label' column not found in {path}")
+    # Resolve category column → standardise to 'class'
+    class_col = _resolve_class_column(df, path)
+    if class_col != "class":
+        df = df.rename(columns={class_col: "class"})
+        logger.info(f"[{artifact_key}] Renamed column '{class_col}' → 'class'")
 
-    # Filter to known SATD categories only
-    df_satd = df[df["label"].isin(SATD_CATEGORIES)].copy()
+    # Keep only rows that belong to a known SATD category
+    before   = len(df)
+    df_satd  = df[df["class"].isin(SATD_CATEGORIES)].copy()
+    removed  = before - len(df_satd)
     logger.info(
         f"[{artifact_key}] After SATD filter: {len(df_satd):,} rows "
-        f"(removed {len(df) - len(df_satd):,} Not-SATD rows)"
+        f"(removed {removed:,} Not-SATD / unknown rows)"
     )
 
+    if len(df_satd) == 0:
+        raise ValueError(
+            f"[{artifact_key}] No SATD rows found after filtering!\n"
+            f"  Unique values in 'class' column: {df['class'].unique().tolist()}\n"
+            f"  Expected one of: {SATD_CATEGORIES}\n"
+            f"  Check that 01_preprocessing.py preserved the original multi-class labels."
+        )
+
+    # Optionally merge augmented data
     if use_augmented:
         aug_path = os.path.normpath(
             os.path.join(data_dir, "..", f"augmented_{artifact_key.lower()}.csv")
         )
         if os.path.isfile(aug_path):
-            df_aug = pd.read_csv(aug_path, encoding="utf-8")
-            df_aug = df_aug[df_aug["label"].isin(SATD_CATEGORIES)].copy()
+            df_aug      = pd.read_csv(aug_path, encoding="utf-8")
+            aug_col     = _resolve_class_column(df_aug, aug_path)
+            if aug_col != "class":
+                df_aug = df_aug.rename(columns={aug_col: "class"})
+            df_aug      = df_aug[df_aug["class"].isin(SATD_CATEGORIES)].copy()
             logger.info(
                 f"[{artifact_key}] Augmented SATD rows: {len(df_aug):,} from {aug_path}"
             )
@@ -247,9 +283,8 @@ def load_artifact_data(
                 f"[{artifact_key}] --use_augmented set but augmented file not found: {aug_path}"
             )
 
-    # ── Label distribution ────────────────────────────────────────────────
     logger.info(f"[{artifact_key}] SATD category distribution:")
-    for cat, cnt in df_satd["label"].value_counts().items():
+    for cat, cnt in df_satd["class"].value_counts().items():
         logger.info(f"           {cat:10s}: {cnt:6d}")
 
     return df_satd
@@ -258,11 +293,28 @@ def load_artifact_data(
 def stratified_split(df: pd.DataFrame):
     """
     80/10/10 stratified split on SATD categories (paper Section III-H).
-    Uses original_text (or cleaned_text if original not present) as input.
+    Uses original_text when available, else cleaned_text.
     """
+    # Prefer the raw text for BERT (it handles its own tokenisation)
     text_col = "original_text" if "original_text" in df.columns else "cleaned_text"
-    X = df[text_col].tolist()
-    y = df["label"].map(LABEL2IDX).tolist()
+    if text_col not in df.columns:
+        raise ValueError(
+            f"Neither 'original_text' nor 'cleaned_text' found in DataFrame. "
+            f"Columns: {list(df.columns)}"
+        )
+
+    X = df[text_col].fillna("").tolist()
+    y = df["class"].map(LABEL2IDX).tolist()
+
+    # Guard: sklearn raises if any split would be empty
+    n_samples  = len(X)
+    n_classes  = len(set(y))
+    min_needed = n_classes * 5          # rough lower bound for stratification
+    if n_samples < min_needed:
+        raise ValueError(
+            f"Too few samples ({n_samples}) to stratify across {n_classes} classes. "
+            f"Need at least ~{min_needed} samples."
+        )
 
     X_train, X_temp, y_train, y_temp = train_test_split(
         X, y, test_size=0.2, random_state=42, stratify=y
@@ -288,20 +340,20 @@ def train_epoch(model, loader, optimizer, scheduler, criterion, device):
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         token_type_ids = batch["token_type_ids"].to(device)
-        labels         = batch["label"].to(device)
+        labels         = batch["class"].to(device)           # ← 'class' key
 
         optimizer.zero_grad()
         logits = model(input_ids, attention_mask, token_type_ids)
-        loss = criterion(logits, labels)
+        loss   = criterion(logits, labels)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
         total_loss += loss.item() * len(labels)
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += len(labels)
+        preds       = logits.argmax(dim=1)
+        correct    += (preds == labels).sum().item()
+        total      += len(labels)
 
     return total_loss / total, correct / total
 
@@ -314,26 +366,24 @@ def evaluate(model, loader, criterion, device):
             input_ids      = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
             token_type_ids = batch["token_type_ids"].to(device)
-            labels         = batch["label"].to(device)
+            labels         = batch["class"].to(device)       # ← 'class' key
 
             logits = model(input_ids, attention_mask, token_type_ids)
-            loss = criterion(logits, labels)
+            loss   = criterion(logits, labels)
             total_loss += loss.item() * len(labels)
             preds = logits.argmax(dim=1)
             all_preds.extend(preds.cpu().tolist())
             all_labels.extend(labels.cpu().tolist())
 
     avg_loss = total_loss / max(len(all_labels), 1)
-    acc = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
+    acc      = sum(p == l for p, l in zip(all_preds, all_labels)) / max(len(all_labels), 1)
     return avg_loss, acc, all_preds, all_labels
 
 
 def compute_metrics(y_true: list, y_pred: list) -> dict:
     """Compute per-class and macro-averaged F1 (as per paper)."""
-    # Only include classes that actually appear in test set
     present_labels = sorted(set(y_true))
     target_names   = [IDX2LABEL[i] for i in present_labels]
-
     report = classification_report(
         y_true, y_pred,
         labels=present_labels,
@@ -350,27 +400,20 @@ def compute_metrics(y_true: list, y_pred: list) -> dict:
 # ---------------------------------------------------------------------------
 
 def append_result(result_path: str, content: str):
-    """Append a result block to the shared result text file."""
     os.makedirs(os.path.dirname(result_path), exist_ok=True)
     with open(result_path, "a", encoding="utf-8") as f:
         f.write(content)
         f.write("\n")
 
 
-def format_result_block(
-    artifact: str,
-    args: argparse.Namespace,
-    metrics: dict,
-    elapsed: float,
-) -> str:
-    """Format a results block for the output text file."""
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    report = metrics["report"]
+def format_result_block(artifact, args, metrics, elapsed):
+    ts           = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report       = metrics["report"]
     target_names = metrics.get("target_names", SATD_CATEGORIES)
 
     lines = [
         "=" * 70,
-        f"BERT SATD Categorization Results",
+        "BERT SATD Categorization Results",
         f"Timestamp      : {ts}",
         f"Artifact       : {artifact}",
         "Command Arguments:",
@@ -410,11 +453,7 @@ def format_result_block(
     ]
     if "accuracy" in report:
         lines.append(f"  {'Accuracy':<12} {report['accuracy']:>10.4f}")
-
-    lines += [
-        f"Training time  : {elapsed:.1f}s",
-        "=" * 70,
-    ]
+    lines += [f"Training time  : {elapsed:.1f}s", "=" * 70]
     return "\n".join(lines) + "\n"
 
 
@@ -423,20 +462,16 @@ def format_result_block(
 # ---------------------------------------------------------------------------
 
 def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
-    """Full train + evaluate pipeline for one artifact."""
     logger.info(f"\n{'='*60}")
     logger.info(f"BERT Categorization — Artifact: {artifact_key}")
     logger.info(f"{'='*60}")
 
-    # ── Data ──────────────────────────────────────────────────────────────
     df = load_artifact_data(artifact_key, args.data_dir, args.use_augmented)
     X_train, X_val, X_test, y_train, y_val, y_test = stratified_split(df)
 
-    # ── Tokenizer ─────────────────────────────────────────────────────────
     logger.info(f"[{artifact_key}] Loading tokenizer: {args.bert_model}")
     tokenizer = BertTokenizer.from_pretrained(args.bert_model)
 
-    # ── Datasets & loaders ────────────────────────────────────────────────
     train_ds = SATDCategoryDataset(X_train, y_train, tokenizer, args.max_seq_len)
     val_ds   = SATDCategoryDataset(X_val,   y_val,   tokenizer, args.max_seq_len)
     test_ds  = SATDCategoryDataset(X_test,  y_test,  tokenizer, args.max_seq_len)
@@ -445,7 +480,6 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
     val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=0)
     test_loader  = DataLoader(test_ds,  batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # ── Model ─────────────────────────────────────────────────────────────
     logger.info(f"[{artifact_key}] Loading BERT model: {args.bert_model}")
     model = BERTSATDClassifier(
         bert_model_name=args.bert_model,
@@ -454,47 +488,41 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
     ).to(DEVICE)
 
     criterion = nn.CrossEntropyLoss()
-
-    # AdamW optimizer with paper hyperparameters (lr=5e-5, eps=1e-8)
     optimizer = AdamW(
         model.parameters(),
         lr=args.learning_rate,
         eps=args.epsilon,
         weight_decay=0.01,
     )
-
     total_steps = len(train_loader) * args.epochs
-    scheduler = get_linear_schedule_with_warmup(
+    scheduler   = get_linear_schedule_with_warmup(
         optimizer,
         num_warmup_steps=int(total_steps * 0.1),
         num_training_steps=total_steps,
     )
 
-    # ── Save paths ────────────────────────────────────────────────────────
     os.makedirs(args.model_dir, exist_ok=True)
-    model_save_dir = os.path.join(args.model_dir, f"bert_{artifact_key}")
-    config_path    = os.path.join(args.model_dir, f"bert_{artifact_key}_config.json")
+    model_save_dir  = os.path.join(args.model_dir, f"bert_{artifact_key}")
+    config_path     = os.path.join(args.model_dir, f"bert_{artifact_key}_config.json")
     best_model_path = os.path.join(args.model_dir, f"bert_{artifact_key}_best.pt")
 
-    # Save config for inference pipeline
     config = {
-        "bert_model": args.bert_model,
+        "bert_model":  args.bert_model,
         "max_seq_len": args.max_seq_len,
         "num_classes": len(SATD_CATEGORIES),
         "hidden_size": args.hidden_size,
-        "label2idx": LABEL2IDX,
-        "idx2label": {str(k): v for k, v in IDX2LABEL.items()},
-        "artifact": artifact_key,
-        "categories": SATD_CATEGORIES,
+        "label2idx":   LABEL2IDX,
+        "idx2label":   {str(k): v for k, v in IDX2LABEL.items()},
+        "artifact":    artifact_key,
+        "categories":  SATD_CATEGORIES,
     }
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
     logger.info(f"[{artifact_key}] Config saved → {config_path}")
 
-    # ── Training loop ─────────────────────────────────────────────────────
-    best_val_loss = float("inf")
+    best_val_loss    = float("inf")
     patience_counter = 0
-    start_time = time.time()
+    start_time       = time.time()
 
     logger.info(
         f"[{artifact_key}] Training on {DEVICE} | "
@@ -514,15 +542,12 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
         )
 
         if val_loss < best_val_loss:
-            best_val_loss = val_loss
+            best_val_loss    = val_loss
             patience_counter = 0
             torch.save(model.state_dict(), best_model_path)
-            # Also save tokenizer alongside model
             os.makedirs(model_save_dir, exist_ok=True)
             tokenizer.save_pretrained(model_save_dir)
-            logger.info(
-                f"[{artifact_key}] Best model saved (val_loss={best_val_loss:.4f})"
-            )
+            logger.info(f"[{artifact_key}] Best model saved (val_loss={best_val_loss:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
@@ -534,7 +559,6 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
 
     elapsed = time.time() - start_time
 
-    # ── Test evaluation ───────────────────────────────────────────────────
     logger.info(f"[{artifact_key}] Loading best model for test evaluation …")
     model.load_state_dict(torch.load(best_model_path, map_location=DEVICE))
     _, test_acc, y_pred, y_true = evaluate(model, test_loader, criterion, DEVICE)
@@ -553,12 +577,10 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
     result_block = format_result_block(artifact_key, args, metrics, elapsed)
     append_result(result_path, result_block)
     logger.info(f"[{artifact_key}] Results appended → {result_path}")
-
     return metrics
 
 
 def run_evaluate_only(artifact_key: str, args: argparse.Namespace, result_path: str):
-    """Load saved BERT model and evaluate on the test set."""
     config_path     = os.path.join(args.model_dir, f"bert_{artifact_key}_config.json")
     best_model_path = os.path.join(args.model_dir, f"bert_{artifact_key}_best.pt")
     model_save_dir  = os.path.join(args.model_dir, f"bert_{artifact_key}")
@@ -618,91 +640,40 @@ def parse_args():
         description="BERT SATD Categorization (Sutoyo et al., 2024)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        "--artifact",
-        type=str,
-        default="all",
-        choices=["CC", "IS", "PS", "CM", "all"],
-        help="Artifact to process. 'all' runs all four.",
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="train",
-        choices=["train", "evaluate"],
-        help="'train' trains and evaluates; 'evaluate' loads saved model.",
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "preprocessed"),
-        help="Directory containing preprocessed CSV files.",
-    )
-    parser.add_argument(
-        "--bert_model",
-        type=str,
-        default="bert-base-uncased",
-        help="HuggingFace BERT model identifier.",
-    )
-    parser.add_argument(
-        "--max_seq_len",
-        type=int,
-        default=128,
-        help="Maximum BERT tokenizer sequence length.",
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=32,
-        help="Mini-batch size (paper: 32).",
-    )
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=10,
-        help="Maximum number of fine-tuning epochs.",
-    )
-    parser.add_argument(
-        "--learning_rate",
-        type=float,
-        default=5e-5,
-        help="AdamW learning rate (paper: 5e-5).",
-    )
-    parser.add_argument(
-        "--epsilon",
-        type=float,
-        default=1e-8,
-        help="AdamW epsilon (paper: 1e-8).",
-    )
-    parser.add_argument(
-        "--hidden_size",
-        type=int,
-        default=256,
-        help="Size of the hidden layer in the BERT classification head.",
-    )
-    parser.add_argument(
-        "--patience",
-        type=int,
-        default=3,
-        help="Early-stopping patience epochs.",
-    )
-    parser.add_argument(
-        "--use_augmented",
-        action="store_true",
-        help="Include AugGPT-augmented training samples if available.",
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"),
-        help="Directory to save result text files.",
-    )
-    parser.add_argument(
-        "--model_dir",
-        type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
-        help="Directory to save/load BERT model checkpoints and configs.",
-    )
+    parser.add_argument("--artifact",      type=str,   default="all",
+                        choices=["CC", "IS", "PS", "CM", "all"],
+                        help="Artifact to process. 'all' runs all four.")
+    parser.add_argument("--mode",          type=str,   default="train",
+                        choices=["train", "evaluate"],
+                        help="'train' trains and evaluates; 'evaluate' loads saved model.")
+    parser.add_argument("--data_dir",      type=str,
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "data", "preprocessed"),
+                        help="Directory containing preprocessed CSV files.")
+    parser.add_argument("--bert_model",    type=str,   default="bert-base-uncased",
+                        help="HuggingFace BERT model identifier.")
+    parser.add_argument("--max_seq_len",   type=int,   default=128,
+                        help="Maximum BERT tokenizer sequence length.")
+    parser.add_argument("--batch_size",    type=int,   default=32,
+                        help="Mini-batch size (paper: 32).")
+    parser.add_argument("--epochs",        type=int,   default=10,
+                        help="Maximum number of fine-tuning epochs.")
+    parser.add_argument("--learning_rate", type=float, default=5e-5,
+                        help="AdamW learning rate (paper: 5e-5).")
+    parser.add_argument("--epsilon",       type=float, default=1e-8,
+                        help="AdamW epsilon (paper: 1e-8).")
+    parser.add_argument("--hidden_size",   type=int,   default=256,
+                        help="Hidden layer size in the BERT classification head.")
+    parser.add_argument("--patience",      type=int,   default=3,
+                        help="Early-stopping patience epochs.")
+    parser.add_argument("--use_augmented", action="store_true",
+                        help="Include AugGPT-augmented training samples if available.")
+    parser.add_argument("--output_dir",    type=str,
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "results"),
+                        help="Directory to save result text files.")
+    parser.add_argument("--model_dir",     type=str,
+                        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "models"),
+                        help="Directory to save/load BERT model checkpoints and configs.")
     return parser.parse_args()
 
 
@@ -715,12 +686,9 @@ def main():
 
     result_path = os.path.join(args.output_dir, "bert_command_arguments.txt")
     os.makedirs(args.output_dir, exist_ok=True)
-    os.makedirs(args.model_dir, exist_ok=True)
+    os.makedirs(args.model_dir,  exist_ok=True)
 
-    if args.artifact == "all":
-        artifacts = list(ARTIFACT_FILES.keys())
-    else:
-        artifacts = [args.artifact]
+    artifacts = list(ARTIFACT_FILES.keys()) if args.artifact == "all" else [args.artifact]
 
     all_metrics = {}
     for artifact_key in artifacts:
@@ -731,6 +699,8 @@ def main():
                 metrics = run_evaluate_only(artifact_key, args, result_path)
             all_metrics[artifact_key] = metrics
         except FileNotFoundError as e:
+            logger.error(str(e))
+        except ValueError as e:
             logger.error(str(e))
         except Exception as e:
             logger.exception(f"[{artifact_key}] Unexpected error: {e}")

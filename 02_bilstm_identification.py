@@ -95,8 +95,8 @@ ARTIFACT_FILES = {
     "PS": "preprocessed_ps.csv",
 }
 
-LABEL2IDX = {"Not-SATD": 0, "SATD": 1}
-IDX2LABEL = {0: "Not-SATD", 1: "SATD"}
+LABEL2IDX = {"non_debt": 0, "SATD": 1}
+IDX2LABEL = {0: "non_debt", 1: "SATD"}
 
 PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
