@@ -73,6 +73,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report, f1_score
+from sklearn.utils.class_weight import compute_class_weight
 from transformers import (
     BertTokenizer,
     BertModel,
@@ -100,7 +101,7 @@ ARTIFACT_FILES = {
 }
 
 # Multi-class SATD categories (paper Section III-G)
-SATD_CATEGORIES = ['documentation_debt', 'requirement_debt', 'test_debt', 'code_debt', 'design_debt']
+SATD_CATEGORIES = ['documentation_debt', 'requirement_debt', 'test_debt', 'structural_debt']  # corresponds to DOC, REQ, TES, C/D in the paper
 LABEL2IDX = {label: idx for idx, label in enumerate(SATD_CATEGORIES)}
 IDX2LABEL  = {idx: label for label, idx in LABEL2IDX.items()}
 NOT_SATD_LABEL = "non_debt"
@@ -248,6 +249,11 @@ def load_artifact_data(
 
     # Keep only rows that belong to a known SATD category
     before   = len(df)
+    # Merge code_debt + design_debt → structural_debt
+    df["class"] = df["class"].replace({
+        "code_debt": "structural_debt",
+        "design_debt": "structural_debt"
+    })
     df_satd  = df[df["class"].isin(SATD_CATEGORIES)].copy()
     removed  = before - len(df_satd)
     logger.info(
@@ -487,7 +493,16 @@ def run_artifact(artifact_key: str, args: argparse.Namespace, result_path: str):
         hidden_size=args.hidden_size,
     ).to(DEVICE)
 
-    criterion = nn.CrossEntropyLoss()
+    # Convert y_train (list of class indices) → numpy
+    class_weights = compute_class_weight(
+        class_weight="balanced",
+        classes=np.unique(y_train),
+        y=y_train
+    )
+
+    class_weights = torch.tensor(class_weights, dtype=torch.float).to(DEVICE)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights,label_smoothing=0.1)
     optimizer = AdamW(
         model.parameters(),
         lr=args.learning_rate,
