@@ -100,7 +100,7 @@ ARTIFACT_FILES = {
 }
 
 # Multi-class SATD categories (paper Section III-G)
-SATD_CATEGORIES = ['non_debt', 'documentation_debt', 'requirement_debt', 'test_debt', 'code_debt', 'design_debt']
+SATD_CATEGORIES = ['documentation_debt', 'requirement_debt', 'test_debt', 'code_debt', 'design_debt']
 LABEL2IDX = {label: idx for idx, label in enumerate(SATD_CATEGORIES)}
 IDX2LABEL  = {idx: label for label, idx in LABEL2IDX.items()}
 NOT_SATD_LABEL = "non_debt"
@@ -197,7 +197,7 @@ def _resolve_class_column(df: pd.DataFrame, path: str) -> str:
       2. 'label'  — used by the preprocessed CSVs written by 01_preprocessing.py
       3. Any other column whose values overlap with SATD_CATEGORIES
     """
-    for candidate in ("class", "label"):
+    for candidate in ("class"):
         if candidate in df.columns:
             return candidate
 

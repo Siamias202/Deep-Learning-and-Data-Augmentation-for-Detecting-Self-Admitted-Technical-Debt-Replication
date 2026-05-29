@@ -88,8 +88,9 @@ ARTIFACT_FILES = {
 }
 
 # SATD type labels as per Li et al. [20] and the paper (Table I)
-SATD_TYPES = {"C/D", "DOC", "TES", "REQ", "SATD"}
+SATD_TYPES = {"code_debt", "design_debt", "test_debt", "requirement_debt", "documentation_debt"} # for commit messages , issues, pull requests
 NOT_SATD_LABEL = "non_debt"
+
 
 # Possible column name variants for the raw text field across different CSVs
 TEXT_COLUMN_CANDIDATES = [
@@ -255,6 +256,24 @@ def make_binary_label(label: str) -> str:
     # Any SATD type maps to 'SATD'
     return "SATD"
 
+def categorize_label(label: str) -> str:
+    """
+    Map multi-class SATD type label to a standardized category.
+
+    Per paper Table I, the SATD types are:
+        - C/D: Code/Design Debt
+        - DOC: Documentation Debt
+        - TES: Test Debt
+        - REQ: Requirement Debt
+        - SATD: General SATD (unspecified type)
+    This function can be used to ensure consistent labeling across datasets.
+    """
+    label_str = str(label).strip()
+    if label_str in SATD_TYPES:
+        return label_str
+    # If it's not a recognized SATD type, treat it as Not-SATD
+    return NOT_SATD_LABEL
+
 
 # ---------------------------------------------------------------------------
 # Per-artifact processing
@@ -328,8 +347,10 @@ def process_artifact(
     # ── Binary label (for BiLSTM identification step) ─────────────────────
     df["binary_label"] = df["class"].apply(make_binary_label)
 
+    df["category_label"] = df["class"].apply(categorize_label)
+
     # ── Column ordering ───────────────────────────────────────────────────
-    cols = ["original_text", "cleaned_text", "class", "binary_label"]
+    cols = ["original_text", "cleaned_text", "class", "binary_label", "category_label"]
     extra_cols = [c for c in df.columns if c not in cols]
     df = df[cols + extra_cols]
 
@@ -346,6 +367,9 @@ def process_artifact(
         logger.info(f"           {label:20s}: {count:6d}")
     logger.info(f"[{artifact_key}] Label distribution (binary):")
     for label, count in df["binary_label"].value_counts().items():
+        logger.info(f"           {label:20s}: {count:6d}")
+    logger.info(f"[{artifact_key}] Label distribution (category):")
+    for label, count in df["category_label"].value_counts().items():
         logger.info(f"           {label:20s}: {count:6d}")
 
     return df
